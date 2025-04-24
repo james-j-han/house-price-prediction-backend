@@ -15,7 +15,7 @@ MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS = {}
 
 for file in os.listdir(MODEL_DIR):
-    if file.endswith('_model.pkl'):
+    if file.endswith('_bundle.pkl'):
         model_name = file.replace('_model.pkl', '').replace('_', ' ').title()
         with open(os.path.join(MODEL_DIR, file), 'rb') as f:
             loaded = pickle.load(f)
@@ -37,48 +37,40 @@ def predict():
     model_bundle = MODELS[model_name]
     model = model_bundle["model"]
     scaler = model_bundle["scaler"]
-    feature_list = model_bundle["features"]  # <-- the exact ordering you trained with
+    raw_features = model_bundle["features"]  # <-- the exact ordering you trained with
 
     # Build a DataFrame from the incoming dict
-    input_df = pd.DataFrame([features])
+    input_df = pd.DataFrame([features])\
+                   .reindex(columns=raw_features, fill_value=0)
 
-    # Reorder and select exactly the columns the model expects
-    try:
-        input_df = input_df[feature_list]
-    except KeyError as e:
-        return jsonify({
-            "error": "Bad input features",
-            "details": str(e),
-            "expected": feature_list,
-            "received": list(input_df.columns)
-        }), 400
+    df_dummies = pd.get_dummies(input_df, drop_first=True)
+
+    
+    # 3) Reindex those dummies to match what scaler saw at fit time
+    #    `scaler.feature_names_in_` holds the exact dummy‐column names
+    expected_cols = scaler.feature_names_in_
+    df_dummies    = df_dummies.reindex(columns=expected_cols, fill_value=0)
 
     # Scale + predict
-    X_scaled = scaler.transform(input_df)
-    log_pred = model.predict(X_scaled)[0]
-    prediction = round(np.exp(log_pred), 2)
+    X_scaled = scaler.transform(df_dummies)
+    raw_pred = model.predict(X_scaled)[0]
+    prediction = round(float(raw_pred), 2)
 
     return jsonify({"prediction": prediction})
 
 @app.route("/correlation", methods=["GET"])
 def get_correlation():
     model_name = request.args.get("model")
-    if model_name not in MODELS:
-        return jsonify({"error": "Model not found"}), 404
+    bundle     = MODELS.get(model_name)
+    if not bundle:
+        return jsonify(error="Model not found"), 404
 
-    # grab the stored corr_matrix dict from your pickle bundle
-    corr = MODELS[model_name].get("corr_matrix")
+    corr = bundle.get("corr_matrix")
     if corr is None:
-        return jsonify({"error": "No correlation matrix stored"}), 500
+        return jsonify(error="No correlation matrix stored"), 500
 
-    # rebuild it as a DataFrame so we can replace NaNs
-    corr_df = pd.DataFrame(corr)
-
-    # here we replace NaN with 0 (or .fillna(None) if you prefer nulls)
-    corr_df = corr_df.fillna(0)
-
-    # convert back to nested dicts and jsonify
-    return jsonify({"matrix": corr_df.to_dict()})
+    # corr is already a nested dict of { feature1: {feature2: value, …}, … }
+    return jsonify(matrix=corr)
 
 @app.route("/evaluation", methods=["POST"])
 def evaluation():
@@ -90,28 +82,13 @@ def evaluation():
     predicted = bundle.get("eval_predicted")
     if actual is None or predicted is None:
         return jsonify(error="No evaluation data stored"), 500
+    
+    if hasattr(actual, "tolist"):
+        actual = actual.tolist()
+    if hasattr(predicted, "tolist"):
+        predicted = predicted.tolist()
+        
     return jsonify(actual=actual, predicted=predicted)
-
-# For Linear Models
-# @app.route("/feature-weights", methods=["POST"])
-# def get_feature_weights():
-#     data = request.get_json()
-#     model_name = data.get("model")
-
-#     if model_name not in MODELS:
-#         return jsonify({"error": "Model not found"}), 404
-
-#     model = MODELS[model_name]["model"]
-#     features = MODELS[model_name]["features"]  # store this when training
-#     if hasattr(model, "coef_"):
-#         weights = model.coef_
-#         feature_weights = [
-#             {"feature": feat, "weight": round(w, 4)}
-#             for feat, w in zip(features, weights)
-#         ]
-#         return jsonify({"weights": feature_weights})
-#     else:
-#         return jsonify({"error": "Model does not have coefficients"}), 400
 
 @app.route("/feature-weights", methods=["POST"])
 def get_feature_weights():
